@@ -1,0 +1,119 @@
+name: Sync Claude Code to Tencent COS
+
+on:
+  schedule:
+    # 每天 UTC 0:00 / 6:00 / 12:00 / 18:00 各检查一次（北京时间 8/14/20/02）
+    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch:
+    inputs:
+      force_download:
+        description: '强制重新下载（即使本地已是最新版本）'
+        type: boolean
+        default: false
+      force_upload:
+        description: '强制重新上传（即使未发生更新）'
+        type: boolean
+        default: false
+      check_only:
+        description: '仅检查版本，不下载也不上传'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # 需要完整历史以便正确 push 回版本文件
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 1. 仅拉取远端版本号，不需要 COS 凭据 ─────────────────────────────
+      - name: Check latest Claude Code version
+        id: check_version
+        run: |
+          OUTPUT=$(python3 sync_claude_to_cos.py --check-only --config sync_claude.toml 2>&1)
+          echo "$OUTPUT"
+          VERSION=$(echo "$OUTPUT" | grep "latest remote version:" | head -1 | awk '{print $NF}')
+          if [ -z "$VERSION" ]; then
+            echo "::error::Failed to detect latest version from remote"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Latest Claude Code version: $VERSION"
+
+      # ── 2. 与仓库中记录的上次同步版本对比 ───────────────────────────────
+      - name: Compare with last synced version
+        id: compare
+        run: |
+          LATEST="${{ steps.check_version.outputs.version }}"
+          STORED=""
+          if [ -f .last-synced-version ]; then
+            STORED=$(tr -d '[:space:]' < .last-synced-version)
+          fi
+          echo "Stored version : ${STORED:-<none>}"
+          echo "Latest version : $LATEST"
+
+          FORCE_DL="${{ inputs.force_download }}"
+          FORCE_UL="${{ inputs.force_upload }}"
+
+          if [ "$LATEST" != "$STORED" ] || [ "$FORCE_DL" = "true" ] || [ "$FORCE_UL" = "true" ]; then
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+            echo "Sync required."
+          else
+            echo "should_sync=false" >> "$GITHUB_OUTPUT"
+            echo "Already at latest version $LATEST — skipping sync."
+          fi
+
+      # ── 3. 仅检查模式：打印结果后直接结束 ───────────────────────────────
+      - name: Check-only summary
+        if: inputs.check_only == 'true'
+        run: |
+          echo "Check-only mode. Latest version: ${{ steps.check_version.outputs.version }}"
+          echo "Sync needed: ${{ steps.compare.outputs.should_sync }}"
+
+      # ── 4. 下载并上传到腾讯 COS ──────────────────────────────────────────
+      - name: Sync packages to COS
+        if: inputs.check_only != 'true' && steps.compare.outputs.should_sync == 'true'
+        env:
+          TENCENT_COS_BUCKET: ${{ secrets.TENCENT_COS_BUCKET }}
+          TENCENT_COS_REGION: ${{ secrets.TENCENT_COS_REGION }}
+          TENCENT_COS_SECRET_ID: ${{ secrets.TENCENT_COS_SECRET_ID }}
+          TENCENT_COS_SECRET_KEY: ${{ secrets.TENCENT_COS_SECRET_KEY }}
+        run: |
+          ARGS="--config sync_claude.toml"
+          if [ "${{ inputs.force_download }}" = "true" ]; then
+            ARGS="$ARGS --force-download"
+          fi
+          if [ "${{ inputs.force_upload }}" = "true" ]; then
+            ARGS="$ARGS --force-upload"
+          fi
+          python3 sync_claude_exe_to_cos.py $ARGS
+
+      # ── 5. 更新版本记录并推回仓库 ────────────────────────────────────────
+      - name: Commit updated version file
+        if: inputs.check_only != 'true' && steps.compare.outputs.should_sync == 'true'
+        run: |
+          VERSION="${{ steps.check_version.outputs.version }}"
+          echo "$VERSION" > .last-synced-version
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .last-synced-version
+          # 只在文件有变化时才提交
+          git diff --staged --quiet && echo "No version change to commit." || \
+            git commit -m "chore: sync Claude Code $VERSION to COS [skip ci]"
+          git push

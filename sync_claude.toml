@@ -1,0 +1,30 @@
+[claude]
+channel = "latest"
+download_base_url = "https://downloads.claude.ai/claude-code-releases"
+gcs_bucket = "claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819"
+gcs_prefix = "claude-code-releases/"
+timeout_seconds = 30
+upload_when_current = false
+
+# bucket / region / secret_id / secret_key 全部通过环境变量注入，无需在此填写
+
+[[targets]]
+name = "claude-code-win-x64"
+platform = "win32-x64"
+local_path = "./claude-code-win-x64/claude.exe"
+metadata_path = "./claude-code-win-x64/claude.exe.meta.json"
+cos_key = "claude-code-win-x64/claude.exe"
+
+[[targets]]
+name = "claude-code-mac-arm64"
+platform = "darwin-arm64"
+local_path = "./claude-code-mac-arm64/claude"
+metadata_path = "./claude-code-mac-arm64/claude.meta.json"
+cos_key = "claude-code-mac-arm64/claude"
+
+[[targets]]
+name = "claude-code-mac-x64"
+platform = "darwin-x64"
+local_path = "./claude-code-mac-x64/claude"
+metadata_path = "./claude-code-mac-x64/claude.meta.json"
+cos_key = "claude-code-mac-x64/claude"

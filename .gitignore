@@ -1,0 +1,7 @@
+# 下载的 Claude Code 二进制文件
+claude-code-win-x64/
+claude-code-mac-arm64/
+claude-code-mac-x64/
+
+# Claude Code 本地工具配置
+.claude/
