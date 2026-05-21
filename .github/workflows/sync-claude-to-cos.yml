@@ -102,7 +102,7 @@ jobs:
           if [ "${{ inputs.force_upload }}" = "true" ]; then
             ARGS="$ARGS --force-upload"
           fi
-          python3 sync_claude_exe_to_cos.py $ARGS
+          python3 sync_claude_to_cos.py $ARGS
 
       # ── 5. 更新版本记录并推回仓库 ────────────────────────────────────────
       - name: Commit updated version file
