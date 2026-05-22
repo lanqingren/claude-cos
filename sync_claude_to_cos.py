@@ -5,9 +5,9 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +25,29 @@ DEFAULT_DOWNLOAD_BASE_URL = "https://downloads.claude.ai/claude-code-releases"
 DEFAULT_GCS_BUCKET = "claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819"
 DEFAULT_GCS_PREFIX = "claude-code-releases/"
 DEFAULT_TIMEOUT_SECONDS = 30
+UPLOAD_MAX_RETRIES = 3
+UPLOAD_PART_SIZE_MB = 20
+UPLOAD_MAX_THREADS = 2
+
+
+def log(target_name: str, message: str, level: str = "info") -> None:
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{level}] [{target_name}] [{ts}] {message}", flush=True)
+
+
+def format_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024  # type: ignore[assignment]
+    return f"{n:.1f} TB"
+
+
+def format_elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s"
 
 
 class SyncError(RuntimeError):
@@ -119,6 +142,8 @@ def main() -> int:
         cos_client = None
 
         for target in targets:
+            t_target_start = time.monotonic()
+            log(target.name, f"--- processing target ---")
             release = build_release_info(settings.sync, catalog, target)
             local = inspect_local_file(settings.sync, catalog, target, release)
             print_status(settings.sync, target, local, release)
@@ -142,7 +167,7 @@ def main() -> int:
 
             should_upload = updated or args.force_upload or settings.sync.upload_when_current
             if args.skip_upload:
-                print(f"[info] [{target.name}] skip upload enabled; COS upload not executed.")
+                log(target.name, "skip upload enabled; COS upload not executed.")
                 continue
 
             if should_upload:
@@ -150,7 +175,9 @@ def main() -> int:
                     cos_client = build_cos_client(settings.cos)
                 upload_to_cos(cos_client, settings.cos, target)
             else:
-                print(f"[info] [{target.name}] local package is already current; COS upload skipped.")
+                log(target.name, "local package is already current; COS upload skipped.")
+
+            log(target.name, f"target done in {format_elapsed(time.monotonic() - t_target_start)}")
 
         return 0
     except SyncError as exc:
@@ -434,15 +461,20 @@ def write_metadata(path: Path, target_name: str, version: str, platform: str, ch
 
 
 def download_and_replace(sync: SyncConfig, target: TargetConfig, release: ReleaseInfo) -> None:
-    print(f"[info] [{target.name}] downloading {release.version} from {release.download_url}")
+    log(target.name, f"downloading {release.version} ({format_bytes(release.size)}) from {release.download_url}")
     target.local_path.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.monotonic()
     temp_path = download_release_binary(sync, target, release)
+    elapsed = time.monotonic() - t0
+    speed = release.size / elapsed if elapsed > 0 else 0
+    log(target.name, f"download complete in {format_elapsed(elapsed)} ({format_bytes(int(speed))}/s)")
     try:
         backup_path = target.local_path.with_suffix(target.local_path.suffix + ".bak")
         if backup_path.exists():
             backup_path.unlink()
 
         if target.local_path.exists():
+            log(target.name, f"backing up existing file to {backup_path.name}")
             os.replace(target.local_path, backup_path)
 
         try:
@@ -456,7 +488,7 @@ def download_and_replace(sync: SyncConfig, target: TargetConfig, release: Releas
             backup_path.unlink()
 
         write_metadata(target.metadata_path, target.name, release.version, target.platform, release.checksum)
-        print(f"[info] [{target.name}] local package updated to {release.version}")
+        log(target.name, f"local package updated to {release.version}")
     except OSError as exc:
         raise SyncError(f"failed to replace local package for {target.name}: {exc}") from exc
     finally:
@@ -471,19 +503,34 @@ def download_release_binary(sync: SyncConfig, target: TargetConfig, release: Rel
     temp_path = Path(raw_path)
 
     try:
+        chunk_size = 1024 * 1024  # 1 MB
+        downloaded = 0
+        last_reported_pct = -10
         with request.urlopen(build_request(release.download_url), timeout=sync.timeout_seconds) as response:
             with temp_path.open("wb") as output:
-                shutil.copyfileobj(response, output)
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded += len(chunk)
+                    if release.size > 0:
+                        pct = int(downloaded * 100 / release.size)
+                        if pct >= last_reported_pct + 10:
+                            last_reported_pct = pct - (pct % 10)
+                            log(target.name, f"download progress: {last_reported_pct}% ({format_bytes(downloaded)}/{format_bytes(release.size)})")
     except (OSError, urlerror.URLError) as exc:
         temp_path.unlink(missing_ok=True)
         raise SyncError(f"failed to download release binary for {target.name}: {exc}") from exc
 
+    log(target.name, f"verifying checksum …")
     actual_checksum = sha256_file(temp_path)
     if actual_checksum != release.checksum:
         temp_path.unlink(missing_ok=True)
         raise SyncError(
             f"download checksum mismatch for {target.name}: expected {release.checksum}, got {actual_checksum}"
         )
+    log(target.name, f"checksum verified: {actual_checksum[:16]}…")
     return temp_path
 
 
@@ -506,18 +553,52 @@ def build_cos_client(cos: CosConfigData) -> Any:
 
 def upload_to_cos(client: Any, cos: CosConfigData, target: TargetConfig) -> None:
     normalized = normalize_cos_key(target.cos_key)
-    print(f"[info] [{target.name}] uploading to cos://{cos.bucket}/{normalized}")
-    try:
-        client.upload_file(
-            Bucket=cos.bucket,
-            LocalFilePath=str(target.local_path),
-            Key=normalized,
-            PartSize=10,
-            MAXThread=4,
-            EnableMD5=True,
-        )
-    except Exception as exc:  # pragma: no cover
-        raise SyncError(f"failed to upload to COS key {normalized}: {exc}") from exc
+    file_size = target.local_path.stat().st_size
+    log(target.name, (
+        f"uploading to cos://{cos.bucket}/{normalized} "
+        f"({format_bytes(file_size)}, "
+        f"PartSize={UPLOAD_PART_SIZE_MB}MB, "
+        f"Threads={UPLOAD_MAX_THREADS}, "
+        f"MaxRetries={UPLOAD_MAX_RETRIES})"
+    ))
+
+    last_reported_pct: list[int] = [-10]
+
+    def progress_callback(consumed: int, total: int) -> None:
+        if total <= 0:
+            return
+        pct = int(consumed * 100 / total)
+        if pct >= last_reported_pct[0] + 10:
+            last_reported_pct[0] = pct - (pct % 10)
+            log(target.name, f"upload progress: {last_reported_pct[0]}% ({format_bytes(consumed)}/{format_bytes(total)})")
+
+    for attempt in range(1, UPLOAD_MAX_RETRIES + 1):
+        last_reported_pct[0] = -10
+        try:
+            t0 = time.monotonic()
+            client.upload_file(
+                Bucket=cos.bucket,
+                LocalFilePath=str(target.local_path),
+                Key=normalized,
+                PartSize=UPLOAD_PART_SIZE_MB,
+                MAXThread=UPLOAD_MAX_THREADS,
+                EnableMD5=True,
+                progress_callback=progress_callback,
+            )
+            elapsed = time.monotonic() - t0
+            speed = file_size / elapsed if elapsed > 0 else 0
+            log(target.name, f"upload complete in {format_elapsed(elapsed)} ({format_bytes(int(speed))}/s)")
+            return
+        except Exception as exc:
+            if attempt < UPLOAD_MAX_RETRIES:
+                wait = 2 ** attempt  # exponential backoff: 2s, 4s
+                log(target.name, f"upload attempt {attempt}/{UPLOAD_MAX_RETRIES} failed: {exc}", level="warn")
+                log(target.name, f"retrying in {wait}s …")
+                time.sleep(wait)
+            else:
+                raise SyncError(
+                    f"failed to upload to COS key {normalized} after {UPLOAD_MAX_RETRIES} attempts: {exc}"
+                ) from exc
 
 
 def validate_cos_settings(cos: CosConfigData) -> None:
@@ -528,22 +609,22 @@ def validate_cos_settings(cos: CosConfigData) -> None:
 
 
 def print_status(sync: SyncConfig, target: TargetConfig, local: LocalInfo, release: ReleaseInfo) -> None:
-    print(f"[info] [{target.name}] channel: {sync.channel}")
-    print(f"[info] [{target.name}] platform: {target.platform}")
-    print(f"[info] [{target.name}] local file: {target.local_path}")
-    print(f"[info] [{target.name}] cos key: {target.cos_key}")
-    print(f"[info] [{target.name}] latest remote version: {release.version}")
+    log(target.name, f"channel: {sync.channel}")
+    log(target.name, f"platform: {target.platform}")
+    log(target.name, f"local file: {target.local_path}")
+    log(target.name, f"cos key: {target.cos_key}")
+    log(target.name, f"latest remote version: {release.version}")
     if local.exists:
         local_version = local.version or "unknown"
         local_source = local.version_source or "unresolved"
-        print(f"[info] [{target.name}] local version: {local_version} ({local_source})")
-        print(f"[info] [{target.name}] local sha256: {local.checksum}")
+        log(target.name, f"local version: {local_version} ({local_source})")
+        log(target.name, f"local sha256: {local.checksum}")
         if local.matches_latest:
-            print(f"[info] [{target.name}] local package already matches the latest release.")
+            log(target.name, "local package already matches the latest release.")
         else:
-            print(f"[info] [{target.name}] local package is behind or unrecognized; update will be applied.")
+            log(target.name, "local package is behind or unrecognized; update will be applied.")
     else:
-        print(f"[info] [{target.name}] local package does not exist; latest release will be downloaded.")
+        log(target.name, "local package does not exist; latest release will be downloaded.")
 
 
 def load_toml_file(path: Path) -> dict[str, Any]:
